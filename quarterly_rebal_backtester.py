@@ -617,11 +617,7 @@ st.caption("Port A: 100 % SPY  |  Port B: 50 % Top-10 (normalised) + 40 % GLD + 
 with st.sidebar:
     st.header("Settings")
 
-    csv_file = st.file_uploader(
-        "Upload top-10 holdings CSV",
-        type=["csv"],
-        help="Must have columns: snapshot_date, rank, ticker, weight_pct"
-    )
+    csv_file = "sp500_top10_semiannual_2007_2026_ivv_proxy.csv"
 
     st.subheader("Backtest Period")
     col_s, col_e = st.columns(2)
