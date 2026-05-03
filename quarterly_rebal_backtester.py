@@ -173,25 +173,16 @@ def max_drawdown(equity_curve):
 
 
 # ─── contribution helpers ────
-def build_yearly_contribution_series(index, annual_amount, month=1, day=2, include_first_year=False):
+def build_quarterly_contribution_series(index, annual_amount):
     idx = pd.DatetimeIndex(index).sort_values()
     cf = pd.Series(0.0, index=idx, dtype=float)
     if annual_amount == 0:
         return cf
-    years = sorted(pd.Index(idx.year).unique())
-    first_year = int(idx.min().year)
-    for y in years:
-        if (not include_first_year) and (y == first_year):
-            continue
-        try:
-            target = pd.Timestamp(year=int(y), month=int(month), day=int(day))
-        except ValueError:
-            target = pd.Timestamp(year=int(y), month=int(month), day=1) + pd.offsets.MonthEnd(0)
-        pos = idx.searchsorted(target, side="left")
-        if pos < len(idx):
-            dt = idx[pos]
-            if dt.year == y:
-                cf.loc[dt] += float(annual_amount)
+    quarterly_amount = annual_amount / 4
+    rebal_dates = quarterly_rebalance_dates(idx)
+    for rd in rebal_dates:
+        if rd in idx:
+            cf.loc[rd] += float(quarterly_amount)
     return cf
 
 
@@ -276,8 +267,7 @@ def build_year_table(equity_curve, contrib_series):
 # CORE BACKTEST
 # ─────────────────────────────────────────────
 def run_backtest(holdings_df, start_date, end_date, initial_capital,
-                 annual_contrib, contrib_month, contrib_day,
-                 include_first_year_contrib, contrib_timing, rf_annual):
+                 annual_contrib, contrib_timing, rf_annual):
     """
     Returns dict with all results needed for display.
     """
@@ -509,9 +499,7 @@ def run_backtest(holdings_df, start_date, end_date, initial_capital,
     portB_ret = portB_ret.loc[start_compare:]
 
     # ── contribution-aware curves ──
-    contrib = build_yearly_contribution_series(
-        portA_ret.index, annual_contrib, month=contrib_month,
-        day=contrib_day, include_first_year=include_first_year_contrib)
+    contrib = build_quarterly_contribution_series(portA_ret.index, annual_contrib)
 
     eqA_lump = initial_capital * (1 + portA_ret).cumprod()
     eqB_lump = initial_capital * (1 + portB_ret).cumprod()
@@ -663,17 +651,14 @@ if missing:
 with st.spinner("Running backtest …"):
     try:
         res = run_backtest(
-            holdings_df,
-            start_date=str(start_input),
-            end_date=str(end_input),
-            initial_capital=initial_capital,
-            annual_contrib=annual_contrib,
-            contrib_month=contrib_month,
-            contrib_day=contrib_day,
-            include_first_year_contrib=include_first_year,
-            contrib_timing=timing,
-            rf_annual=rf_annual,
-        )
+    holdings_df,
+    start_date=str(start_input),
+    end_date=str(end_input),
+    initial_capital=initial_capital,
+    annual_contrib=annual_contrib,
+    contrib_timing=timing,
+    rf_annual=rf_annual,
+)
     except Exception as e:
         st.error(f"Backtest failed: {e}")
         st.stop()
