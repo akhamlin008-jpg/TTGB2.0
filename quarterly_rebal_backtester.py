@@ -622,7 +622,7 @@ with st.sidebar:
     st.subheader("Backtest Period")
     col_s, col_e = st.columns(2)
     with col_s:
-        start_input = st.date_input("Start", value=pd.Timestamp("2007-05-15").date())
+        start_input = st.date_input("Start", value=pd.Timestamp("2015-01-01").date())
     with col_e:
         end_input = st.date_input("End", value=pd.Timestamp.today().date())
 
