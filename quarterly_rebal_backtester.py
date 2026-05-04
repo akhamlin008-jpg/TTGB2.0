@@ -211,16 +211,59 @@ def max_drawdown(equity_curve):
 
 
 # ─── contribution helpers ────
-def build_quarterly_contribution_series(index, annual_amount):
+def build_quarterly_contribution_series(
+    index,
+    annual_amount,
+    contrib_month=1,
+    contrib_day=2,
+    include_first_year=False,
+):
+    """
+    Build a contribution cash-flow series.
+
+    Quarterly contributions are placed on (or after) the configured
+    contribution day of months {contrib_month, +3, +6, +9}. If the chosen
+    calendar day is not a trading day (weekend/holiday), the contribution
+    falls on the next available trading day.
+
+    contrib_month: 1-12, the calendar month of the *first* contribution
+                   in each year (e.g., 1=January). Subsequent contributions
+                   land 3, 6, and 9 months after that.
+    contrib_day:   1-31. Snapped to next trading day if necessary, or to
+                   month-end if the day exceeds the month length.
+    include_first_year: if False, skip contributions in the very first
+                        calendar year of the backtest (common for accounts
+                        that fund initial_capital and contribute starting
+                        the next year).
+    """
     idx = pd.DatetimeIndex(index).sort_values()
     cf = pd.Series(0.0, index=idx, dtype=float)
-    if annual_amount == 0:
+    if annual_amount == 0 or len(idx) == 0:
         return cf
+
     quarterly_amount = annual_amount / 4
-    rebal_dates = quarterly_rebalance_dates(idx)
-    for rd in rebal_dates:
-        if rd in idx:
-            cf.loc[rd] += float(quarterly_amount)
+
+    # Generate target dates: quarterly anchors at (month, day) and +3, +6, +9 months
+    contrib_months = [((contrib_month - 1 + offset) % 12) + 1 for offset in (0, 3, 6, 9)]
+
+    first_year = int(idx.min().year)
+    last_year = int(idx.max().year)
+
+    for year in range(first_year, last_year + 1):
+        if not include_first_year and year == first_year:
+            continue
+        for m in contrib_months:
+            # Snap the day to the actual month length (handles Feb 30 → Feb 28/29)
+            month_end_day = pd.Timestamp(year=year, month=m, day=1).days_in_month
+            day = min(contrib_day, month_end_day)
+            target = pd.Timestamp(year=year, month=m, day=day)
+
+            # Snap to next trading day in the index (or skip if past the data range)
+            actual = same_or_next_trading_day(idx, target)
+            if actual is None:
+                continue
+            cf.loc[actual] += float(quarterly_amount)
+
     return cf
 
 
@@ -308,7 +351,8 @@ def run_backtest(holdings_df, start_date, end_date, initial_capital,
                  annual_contrib, contrib_timing, rf_annual,
                  cost_bps=10.0, crypto_cost_bps=30.0,
                  top10_sleeve=None, gld_sleeve=None, btc_sleeve=None,
-                 rebal_frequency="quarterly"):
+                 rebal_frequency="quarterly",
+                 contrib_month=1, contrib_day=2, include_first_year=False):
     """
     If top10_sleeve / gld_sleeve / btc_sleeve are None, the module-level
     defaults (0.50 / 0.40 / 0.10) are used. The sensitivity grid passes
@@ -593,7 +637,13 @@ def run_backtest(holdings_df, start_date, end_date, initial_capital,
     portB_ret = portB_ret.loc[start_compare:]
 
     # ── contribution-aware curves ──
-    contrib = build_quarterly_contribution_series(portA_ret.index, annual_contrib)
+    contrib = build_quarterly_contribution_series(
+        portA_ret.index,
+        annual_contrib,
+        contrib_month=contrib_month,
+        contrib_day=contrib_day,
+        include_first_year=include_first_year,
+    )
 
     eqA_lump = initial_capital * (1 + portA_ret).cumprod()
     eqB_lump = initial_capital * (1 + portB_ret).cumprod()
@@ -772,6 +822,9 @@ with st.spinner("Running backtest …"):
     rf_annual=rf_annual,
     cost_bps=cost_bps,
     crypto_cost_bps=crypto_cost_bps,
+    contrib_month=contrib_month,
+    contrib_day=contrib_day,
+    include_first_year=include_first_year,
 )
     except Exception as e:
         st.error(f"Backtest failed: {e}")
