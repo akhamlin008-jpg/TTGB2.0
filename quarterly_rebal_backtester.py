@@ -18,6 +18,7 @@ import yfinance as yf
 # New modules — transaction costs, BTC start-date handling, parameter sensitivity
 from transaction_costs import apply_transaction_costs
 from btc_start_handler import check_data_availability, emit_truncation_warning
+from sensitivity import run_sensitivity_grid, summarize_robustness, default_weight_grid
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
@@ -25,9 +26,9 @@ BENCHMARK = "SPY"
 GOLD_ETF = "GLD"          # GLD inception 2004-11-18 beats IAU 2005-01-21
 BTC_TICKER = "BTC-USD"
 
-TOP10_SLEEVE = 0.50
+TOP10_SLEEVE = 0.40
 GLD_SLEEVE   = 0.40
-BTC_SLEEVE   = 0.10
+BTC_SLEEVE   = 0.20
 
 USE_NEXT_DAY_EXECUTION = True
 STRICT_START_WHEN_ALL_COMPONENTS_LIVE = True
@@ -115,6 +116,40 @@ def quarterly_rebalance_dates(trade_index):
     quarter_periods = ti.to_period("Q")
     first_of_quarter = s.groupby(quarter_periods).head(1).index
     return pd.DatetimeIndex(first_of_quarter)
+
+
+def rebalance_dates_by_frequency(trade_index, frequency="quarterly"):
+    """
+    First trading day of each period, given a frequency.
+
+    Supported frequencies:
+        - "monthly"     → first trading day of each month
+        - "quarterly"   → first trading day of each calendar quarter
+        - "semiannual"  → first trading day of January and July
+        - "annual"      → first trading day of each calendar year
+    """
+    ti = pd.DatetimeIndex(trade_index).sort_values()
+    s = pd.Series(1, index=ti)
+
+    if frequency == "monthly":
+        periods = ti.to_period("M")
+    elif frequency == "quarterly":
+        periods = ti.to_period("Q")
+    elif frequency == "semiannual":
+        # Group by year + half-year (1 = Jan-Jun, 2 = Jul-Dec)
+        periods = pd.PeriodIndex.from_fields(
+            year=ti.year,
+            quarter=((ti.month - 1) // 6) * 2 + 1,  # quarter 1 or 3
+            freq="Q",
+        )
+    elif frequency == "annual":
+        periods = ti.to_period("Y")
+    else:
+        raise ValueError(f"Unknown rebalance frequency: {frequency!r}. "
+                         f"Use one of: monthly, quarterly, semiannual, annual")
+
+    first_of_period = s.groupby(periods).head(1).index
+    return pd.DatetimeIndex(first_of_period)
 
 
 # ─── performance helpers ────
@@ -271,7 +306,24 @@ def build_year_table(equity_curve, contrib_series):
 # ─────────────────────────────────────────────
 def run_backtest(holdings_df, start_date, end_date, initial_capital,
                  annual_contrib, contrib_timing, rf_annual,
-                 cost_bps=10.0, crypto_cost_bps=30.0):
+                 cost_bps=10.0, crypto_cost_bps=30.0,
+                 top10_sleeve=None, gld_sleeve=None, btc_sleeve=None,
+                 rebal_frequency="quarterly"):
+    """
+    If top10_sleeve / gld_sleeve / btc_sleeve are None, the module-level
+    defaults (0.50 / 0.40 / 0.10) are used. The sensitivity grid passes
+    explicit values to test alternate allocations.
+    """
+    # Resolve sleeve weights (use module defaults if not specified)
+    top10_w = TOP10_SLEEVE if top10_sleeve is None else float(top10_sleeve)
+    gld_w   = GLD_SLEEVE   if gld_sleeve   is None else float(gld_sleeve)
+    btc_w   = BTC_SLEEVE   if btc_sleeve   is None else float(btc_sleeve)
+
+    # Sanity check — sleeves must sum to ~1.0
+    sleeve_sum = top10_w + gld_w + btc_w
+    if abs(sleeve_sum - 1.0) > 1e-4:
+        raise ValueError(f"Sleeve weights must sum to 1.0, got {sleeve_sum:.4f} "
+                         f"(top10={top10_w}, gld={gld_w}, btc={btc_w})")
     """
     Returns dict with all results needed for display.
     """
@@ -361,7 +413,8 @@ def run_backtest(holdings_df, start_date, end_date, initial_capital,
                         .reset_index(drop=True))
 
     # ── QUARTERLY rebalance schedule ──
-    quarterly_dates = quarterly_rebalance_dates(prices.index)
+# ── Rebalance schedule (frequency configurable for sensitivity analysis) ──
+    quarterly_dates = rebalance_dates_by_frequency(prices.index, frequency=rebal_frequency)
     snapshot_rebal_dates = pd.DatetimeIndex(snapshot_exec_df["exec_date"].unique())
     rebal_dates = pd.DatetimeIndex(sorted(set(quarterly_dates) | set(snapshot_rebal_dates)))
     rebal_dates = rebal_dates[(rebal_dates >= prices.index.min()) & (rebal_dates <= prices.index.max())]
@@ -390,31 +443,32 @@ def run_backtest(holdings_df, start_date, end_date, initial_capital,
         top10_source = "csv"
         top10_used = []
         if w_raw is None or len(w_raw) < 2:
-            tw[BENCHMARK] += TOP10_SLEEVE
+            tw[BENCHMARK] += top10_w
             top10_source = "fallback_spy_missing_snapshot"
         else:
             usable = [(t, float(w)) for t, w in w_raw.items()
                       if (t in prices.columns and pd.notna(prices.at[rd, t]))]
             if len(usable) < 2:
-                tw[BENCHMARK] += TOP10_SLEEVE
+                tw[BENCHMARK] += top10_w
                 top10_source = "fallback_spy_missing_prices"
             else:
                 wsum = sum(w for _, w in usable)
                 for t, w in usable:
-                    tw[t] += TOP10_SLEEVE * (w / wsum)   # normalise within sleeve → sums to 50 %
+                    tw[t] += top10_w * (w / wsum)   # normalise within sleeve
                 top10_used = [t for t, _ in usable]
 
         # gold
         if pd.notna(prices.at[rd, GOLD_ETF]):
-            tw[GOLD_ETF] += GLD_SLEEVE
+            tw[GOLD_ETF] += gld_w
         else:
-            tw[BENCHMARK] += GLD_SLEEVE
+            tw[BENCHMARK] += gld_w
 
-        # btc
-        if pd.notna(prices.at[rd, BTC_TICKER]):
-            tw[BTC_TICKER] += BTC_SLEEVE
-        else:
-            tw[BENCHMARK] += BTC_SLEEVE
+        # btc — only allocate if BTC sleeve > 0 (sensitivity grid tests no-BTC variants)
+        if btc_w > 0:
+            if pd.notna(prices.at[rd, BTC_TICKER]):
+                tw[BTC_TICKER] += btc_w
+            else:
+                tw[BENCHMARK] += btc_w
 
         s = tw.sum()
         if s <= 0:
@@ -677,6 +731,16 @@ with st.sidebar:
     show_dd = st.checkbox("Drawdown chart", value=True)
     show_yearly = st.checkbox("Year-by-year table", value=True)
 
+    st.subheader("Sensitivity Analysis")
+    run_sensitivity = st.checkbox(
+        "Run parameter sensitivity grid",
+        value=False,
+        help="Tests the strategy across multiple weight combinations and "
+             "rebalance frequencies to check whether results are robust or "
+             "depend on a single specific parameter point (overfitting check). "
+             "Adds significant runtime — disable for quick iterations."
+    )
+
     run = st.button("Run Backtest", type="primary")
 
 # ── main area ──
@@ -810,3 +874,104 @@ if not koyfin.empty:
     )
 else:
     st.info("No trades generated.")
+
+
+# ── Sensitivity Analysis ──
+if run_sensitivity:
+    st.markdown("---")
+    st.subheader("Sensitivity Analysis")
+    st.caption(
+        "Tests the strategy across multiple weight allocations and rebalance "
+        "frequencies. A robust strategy should perform reasonably across the "
+        "grid; a strategy that only works at one specific point is likely "
+        "overfit."
+    )
+
+    weight_grid = default_weight_grid()
+    rebal_freqs = ["monthly", "quarterly", "semiannual", "annual"]
+
+    progress_text = st.empty()
+    progress_text.info(
+        f"Running {len(weight_grid)} weights × {len(rebal_freqs)} frequencies "
+        f"= {len(weight_grid) * len(rebal_freqs)} backtests. This will take a minute…"
+    )
+
+    with st.spinner("Running sensitivity grid..."):
+        try:
+            sens_df = run_sensitivity_grid(
+                run_backtest_fn=run_backtest,
+                holdings_df=holdings_df,
+                start_date=str(start_input),
+                end_date=str(end_input),
+                initial_capital=initial_capital,
+                weight_grid=weight_grid,
+                rebal_freqs=rebal_freqs,
+                annual_contrib=annual_contrib,
+                contrib_timing=timing,
+                rf_annual=rf_annual,
+                cost_bps=cost_bps,
+            )
+            progress_text.empty()
+        except Exception as e:
+            progress_text.empty()
+            st.error(f"Sensitivity analysis failed: {e}")
+            sens_df = pd.DataFrame()
+
+    if not sens_df.empty:
+        # Summary statistics
+        summary = summarize_robustness(sens_df)
+        if "error" not in summary:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric(
+                    "Combinations tested",
+                    f"{summary['n_combinations_tested']}",
+                )
+            with col2:
+                st.metric(
+                    "% beating SPY (Sharpe)",
+                    f"{summary['pct_combinations_beating_spy_sharpe']:.0%}",
+                    help="What fraction of weight/frequency combinations had a higher "
+                         "Sharpe ratio than SPY buy-and-hold."
+                )
+            with col3:
+                st.metric(
+                    "Sharpe range across grid",
+                    f"{summary['sharpe_min']:.2f} — {summary['sharpe_max']:.2f}",
+                    help="Narrower range = more robust. Wide range with the baseline "
+                         "near the top suggests the chosen point may be optimized."
+                )
+
+            st.write("**Best configuration:**", summary["best_config"])
+            st.write("**Worst configuration:**", summary["worst_config"])
+
+        # Format the results table for display
+        display_df = sens_df.copy()
+        for col in ["Strategy CAGR", "Strategy Vol", "Strategy Max DD",
+                    "SPY CAGR", "Excess CAGR vs SPY"]:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].map(
+                    lambda x: "" if pd.isna(x) else f"{x:.2%}"
+                )
+        for col in ["Strategy Sharpe", "SPY Sharpe", "Sharpe Diff vs SPY"]:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].map(
+                    lambda x: "" if pd.isna(x) else f"{x:.3f}"
+                )
+        for col in ["Strategy Terminal"]:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].map(
+                    lambda x: "" if pd.isna(x) else f"${x:,.0f}"
+                )
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # Download as CSV for offline analysis
+        csv_buf = io.StringIO()
+        sens_df.to_csv(csv_buf, index=False)
+        st.download_button(
+            label="Download Sensitivity Results CSV",
+            data=csv_buf.getvalue(),
+            file_name="sensitivity_results.csv",
+            mime="text/csv",
+        )
