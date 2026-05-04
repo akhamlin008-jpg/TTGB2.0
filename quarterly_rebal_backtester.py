@@ -15,6 +15,9 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import yfinance as yf
 
+# New modules — transaction costs, BTC start-date handling, parameter sensitivity
+from transaction_costs import apply_transaction_costs
+from btc_start_handler import check_data_availability, emit_truncation_warning
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
@@ -267,7 +270,8 @@ def build_year_table(equity_curve, contrib_series):
 # CORE BACKTEST
 # ─────────────────────────────────────────────
 def run_backtest(holdings_df, start_date, end_date, initial_capital,
-                 annual_contrib, contrib_timing, rf_annual):
+                 annual_contrib, contrib_timing, rf_annual,
+                 cost_bps=10.0, crypto_cost_bps=30.0):
     """
     Returns dict with all results needed for display.
     """
@@ -321,7 +325,18 @@ def run_backtest(holdings_df, start_date, end_date, initial_capital,
         live_mask = prices_sampled_raw[[BENCHMARK, GOLD_ETF, BTC_TICKER]].notna().all(axis=1)
         if not live_mask.any():
             raise RuntimeError("No overlap where SPY, GLD, and BTC all have data.")
-        prices = prices.loc[live_mask[live_mask].index.min():].copy()
+
+        # Check whether the user's requested start was truncated by data availability
+        effective_start_date = live_mask[live_mask].index.min()
+        truncation_report = check_data_availability(
+            requested_start=pd.Timestamp(start_date),
+            requested_end=pd.Timestamp(end_date),
+            has_btc=True,
+            has_gold=True,
+        )
+        emit_truncation_warning(truncation_report, mode="streamlit")
+
+        prices = prices.loc[effective_start_date:].copy()
         trade_index = prices.index
 
     rets = prices.pct_change().fillna(0.0)
@@ -484,10 +499,35 @@ def run_backtest(holdings_df, start_date, end_date, initial_capital,
     target_weights = target_weights.ffill().fillna(0.0)
 
     # ── compute returns ──
+    # ── compute returns ──
     portA_ret = rets[BENCHMARK].fillna(0.0)
     w_lag = target_weights.shift(1).reindex(rets.index).fillna(0.0)
     common_cols = [c for c in w_lag.columns if c in rets.columns]
-    portB_ret = (w_lag[common_cols] * rets[common_cols]).sum(axis=1)
+    portB_ret_pre_cost = (w_lag[common_cols] * rets[common_cols]).sum(axis=1)
+
+    # Apply transaction costs to Portfolio B
+    # Build pre-cost equity curve for cost calculation (uses same starting capital)
+    eqB_pre_cost = initial_capital * (1 + portB_ret_pre_cost).cumprod()
+    cost_dollars = apply_transaction_costs(
+        target_weights=target_weights,
+        equity_curve=eqB_pre_cost,
+        rebal_dates=rebal_dates,
+        cost_bps=cost_bps,
+        crypto_tickers=[BTC_TICKER],
+        crypto_cost_bps=crypto_cost_bps,
+    )
+
+    # Convert dollar costs to a return drag (cost / portfolio_value at each rebalance)
+    cost_drag = pd.Series(0.0, index=portB_ret_pre_cost.index)
+    for dt, c in cost_dollars.items():
+        if c > 0 and dt in eqB_pre_cost.index:
+            pv = float(eqB_pre_cost.loc[dt])
+            if pv > 0:
+                cost_drag.loc[dt] = c / pv
+    portB_ret = portB_ret_pre_cost - cost_drag
+
+    # Save the total cost for reporting
+    total_costs_paid = float(cost_dollars.sum())
 
     first_b = target_weights.sum(axis=1)
     first_b_date = first_b[first_b > 0].index.min()
@@ -591,6 +631,8 @@ def run_backtest(holdings_df, start_date, end_date, initial_capital,
         "yearly_A": yearly_A, "yearly_B": yearly_B,
         "portA_ret": portA_ret, "portB_ret": portB_ret,
         "koyfin_trades": koyfin_df,
+        "total_costs_paid": total_costs_paid,
+        "cost_dollars": cost_dollars,
     }
 
 
@@ -622,6 +664,12 @@ with st.sidebar:
     include_first_year = st.checkbox("Include first-year contribution", value=False)
     timing = st.selectbox("Contribution Timing", ["end_of_day", "start_of_day"])
     rf_annual = st.number_input("Risk-Free Rate (annual)", value=0.0, step=0.005, format="%.4f")
+
+    st.subheader("Transaction Costs")
+    cost_bps = st.number_input("Equity cost (bps)", value=10.0, min_value=0.0, step=1.0,
+                                help="Per-side cost in basis points for SPY/GLD/equities. 10 bps = 0.10%")
+    crypto_cost_bps = st.number_input("BTC cost (bps)", value=30.0, min_value=0.0, step=5.0,
+                                       help="Per-side cost in basis points for BTC. Historically wider spreads.")
 
     st.subheader("Display")
     show_lump = st.checkbox("Lump-sum curves", value=True)
@@ -658,6 +706,8 @@ with st.spinner("Running backtest …"):
     annual_contrib=annual_contrib,
     contrib_timing=timing,
     rf_annual=rf_annual,
+    cost_bps=cost_bps,
+    crypto_cost_bps=crypto_cost_bps,
 )
     except Exception as e:
         st.error(f"Backtest failed: {e}")
@@ -681,6 +731,12 @@ for c in ["Terminal (Lump Sum)", "Terminal (w/ Contrib)", "Total Contributed", "
 
 st.dataframe(fmt, use_container_width=True)
 
+st.metric(
+    label="Total Transaction Costs Paid (Portfolio B)",
+    value=f"${res['total_costs_paid']:,.2f}",
+    help=f"Cumulative cost drag from {len(res['cost_dollars'][res['cost_dollars'] > 0])} rebalance events. "
+         f"Already deducted from Portfolio B's returns."
+)
 # ── equity curves ──
 if show_lump or show_contrib:
     st.subheader("Equity Curves")

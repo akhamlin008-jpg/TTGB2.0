@@ -14,7 +14,7 @@ import pytest
 
 # Import the functions under test. Adjust the import path to match your project.
 # If your main file is `backtester.py`, this works; otherwise change it.
-from backtester import (
+from quarterly_rebal_backtester import (
     annualized_return_from_daily,
     annualized_vol,
     sharpe_ratio,
