@@ -25,8 +25,7 @@ The project is intentionally a **methodology demonstration** — the allocation 
 
 ```bash
 pip install -r requirements.txt
-streamlit run backtester.py
-```
+quarterly_rebal_backtester.py```
 
 Tests:
 
